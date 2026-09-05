@@ -1,0 +1,5 @@
+ARG OMNIROUTE_IMAGE=diegosouzapw/omniroute:3.8.50-web
+FROM ${OMNIROUTE_IMAGE}
+
+COPY --chown=node:node scripts/patch-muse-spark-1.3.mjs /tmp/patch-muse-spark-1.3.mjs
+RUN node /tmp/patch-muse-spark-1.3.mjs && rm /tmp/patch-muse-spark-1.3.mjs
