@@ -231,6 +231,47 @@ curl -s http://localhost:20128/api/cli-tools/openclaw-settings | jq '{installed,
 
 ---
 
+## Memory Issues
+
+### Container RSS grows over hours while JS heap stays flat
+
+`GET /api/monitoring/health` → `system.memoryUsage`: when `rss` climbs into gigabytes
+but `heapUsed`/`heapTotal` stay flat, the growth is native (glibc `brk` arena), not a V8
+leak — lowering `--max-old-space-size` will not help. Confirm at OS level with
+`/proc/<pid>/smaps_rollup` (`Pss_Anon` ≫ Node heap) and the `[heap]` segment in
+`/proc/<pid>/maps`.
+
+Root cause seen in production (2026-09): every multi-MB chat body transiently allocates
+~3–6× its size across body buffering (`request.clone()` + `cloned.json()` in
+`src/app/api/v1/chat/completions/route.ts`), guardrails and logging. glibc keeps the
+high-water mark when small long-lived allocations pin the top chunk, so `brk` ratchets
+up under sustained large-body traffic. The V8-side counterpart of the same transient is
+already guarded by `src/shared/middleware/chatBodyAdmission.ts` (sheds large bodies with
+503 only under heap pressure; see also #4380 single-parse, #5152).
+
+Mitigations applied to the production Compose:
+
+```yaml
+- MALLOC_ARENA_MAX=2 # fewer arenas pinning memory
+- MALLOC_TRIM_THRESHOLD_=65536 # return freed top-chunks to the OS aggressively
+mem_limit: 2g # cgroup cap: OOM-kill + restart instead of host swap stall
+memswap_limit: 2g # no swap escape for the capped container
+```
+
+Plus a daily 04:20 MSK Compose restart cron as a backstop. Verified with a zero-quota
+probe (failing 4 MB bodies, no upstream): without the trim knob `brk` gained ~19 MB per
+request and stayed; with it the peak is ~3 MB per request and `brk` returns to baseline
+on idle.
+
+Related upstream reports: #8868 (slow 1 GB / 7 days growth), #12284 / PR #12179 (bounded
+hot-path caches, merged), #12812 (compression worker-pool idle eviction — the pool file
+does not exist in the 3.8.50 tree, not applicable). Unrelated waste noticed during the
+investigation (not a leak): `vision-bridge` with no `VISION_BRIDGE_API_KEY`/`OPENAI_API_KEY`
+configured POSTs every image to `api.openai.com` and always fails 401 before falling back
+to the original image.
+
+---
+
 ## Cost Issues
 
 ### High Costs
