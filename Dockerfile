@@ -313,7 +313,7 @@ RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,targe
 
 USER node
 
-FROM runner-base AS runner-cli
+FROM runner-web AS runner-cli
 
 # Drop back to root briefly so we can install system + global npm packages,
 # then return to the `node` non-root user before the CMD inherited from

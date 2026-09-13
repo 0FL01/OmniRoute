@@ -35,8 +35,11 @@ services:
         condition: service_started
     build:
       context: .
-      dockerfile: Dockerfile.muse-hotfix
-    image: omniroute:3.8.50-muse13
+      target: runner-cli
+      args:
+        OMNIROUTE_BASE_PATH: ${OMNIROUTE_BASE_PATH:-}
+        OMNIROUTE_BUILD_MEMORY_MB: ${OMNIROUTE_BUILD_MEMORY_MB:-4608}
+    image: ghcr.io/0fl01/omniroute:main
     restart: unless-stopped
     stop_grace_period: 40s
     # Safety cap while native RSS leak is investigated (2026-09-06: 5.3GiB RSS
