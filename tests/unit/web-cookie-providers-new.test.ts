@@ -6,11 +6,15 @@ const { PoeWebExecutor } = await import("../../open-sse/executors/poe-web.ts");
 const { VeniceWebExecutor } = await import("../../open-sse/executors/venice-web.ts");
 const { V0VercelWebExecutor } = await import("../../open-sse/executors/v0-vercel-web.ts");
 const { KimiWebExecutor } = await import("../../open-sse/executors/kimi-web.ts");
+const { MoonshotExecutor } = await import("../../open-sse/executors/moonshot.ts");
 const { DoubaoWebExecutor } = await import("../../open-sse/executors/doubao-web.ts");
 const { QwenWebExecutor } = await import("../../open-sse/executors/qwen-web.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+type MockFetchInput = Parameters<typeof fetch>[0];
+type MockFetchInit = Parameters<typeof fetch>[1];
 
 function mockSSEStream(chunks: string[]) {
   const encoder = new TextEncoder();
@@ -70,7 +74,7 @@ function mockFetchCapture(status = 200, responseBody?: ReadableStream | string) 
         })
       : responseBody;
 
-  globalThis.fetch = async (url: any, opts: any) => {
+  globalThis.fetch = async (url: MockFetchInput, opts?: MockFetchInit) => {
     capturedUrl = String(url);
     capturedHeaders = opts?.headers || {};
     capturedBody = opts?.body || null;
@@ -115,9 +119,11 @@ test("HuggingChat executor is registered", () => {
 
 test("Poe Web executor is registered", () => {
   assert.ok(hasSpecializedExecutor("poe-web"));
-  assert.ok(hasSpecializedExecutor("poe"));
   const executor = getExecutor("poe-web");
   assert.ok(executor instanceof PoeWebExecutor);
+  // #8969: canonical API-key `poe` must not route through PoeWebExecutor.
+  assert.equal(hasSpecializedExecutor("poe"), false);
+  assert.ok(!(getExecutor("poe") instanceof PoeWebExecutor));
 });
 
 test("Venice Web executor is registered", () => {
@@ -135,13 +141,12 @@ test("v0 Vercel Web executor is registered", () => {
 });
 
 test("Kimi Web executor is registered", () => {
-  assert.ok(hasSpecializedExecutor("kimi-web"));
-  // #4699: the `kimi` API-key provider must NOT be routed through KimiWebExecutor
-  // (Bug 2) — it correctly falls through to DefaultExecutor. Only the explicit
-  // kimi-web alias keeps the specialized web executor.
-  assert.equal(hasSpecializedExecutor("kimi"), false);
-  const executor = getExecutor("kimi-web");
-  assert.ok(executor instanceof KimiWebExecutor);
+  assert.ok(getExecutor("kimi-web") instanceof KimiWebExecutor);
+  // #4699: the legacy `kimi` API-key id must never route through Kimi Web.
+  assert.ok(hasSpecializedExecutor("kimi"));
+  const legacyExecutor = getExecutor("kimi");
+  assert.ok(legacyExecutor instanceof MoonshotExecutor);
+  assert.ok(!(legacyExecutor instanceof KimiWebExecutor));
 });
 
 test("Doubao Web executor is registered", () => {
@@ -187,7 +192,6 @@ test("Doubao Web sets correct provider", () => {
 
 test("Qwen Web executor is registered", () => {
   assert.ok(hasSpecializedExecutor("qwen-web"));
-  assert.ok(hasSpecializedExecutor("qw"));
   const executor = getExecutor("qwen-web");
   assert.ok(executor instanceof QwenWebExecutor);
 });
@@ -210,7 +214,7 @@ test("HuggingChat: streaming returns SSE chunks", async () => {
 
   const original = globalThis.fetch;
   let callCount = 0;
-  globalThis.fetch = async (url: any, opts: any) => {
+  globalThis.fetch = async (url: MockFetchInput, opts?: MockFetchInit) => {
     callCount++;
     if (callCount === 1) {
       // First call: create conversation
@@ -250,7 +254,7 @@ test("HuggingChat: sends current web data payload with the root parent id", asyn
   const original = globalThis.fetch;
   let sentData: Record<string, unknown> | null = null;
   let callCount = 0;
-  globalThis.fetch = async (_url: any, opts: any) => {
+  globalThis.fetch = async (_url: MockFetchInput, opts?: MockFetchInit) => {
     callCount++;
     if (callCount === 1) {
       return new Response(JSON.stringify({ conversationId: "test-conv-123" }), {
@@ -298,7 +302,7 @@ test("HuggingChat: carries create response Set-Cookie into message send", async 
   const original = globalThis.fetch;
   let sendCookie = "";
   let callCount = 0;
-  globalThis.fetch = async (_url: any, opts: any) => {
+  globalThis.fetch = async (_url: MockFetchInput, opts?: MockFetchInit) => {
     callCount++;
     if (callCount === 1) {
       return new Response(JSON.stringify({ conversationId: "test-conv-123" }), {
@@ -347,7 +351,7 @@ test("HuggingChat: default model is a current concrete catalog model", async () 
   const original = globalThis.fetch;
   let createModel: unknown = null;
   let callCount = 0;
-  globalThis.fetch = async (_url: any, opts: any) => {
+  globalThis.fetch = async (_url: MockFetchInput, opts?: MockFetchInit) => {
     callCount++;
     if (callCount === 1) {
       createModel = JSON.parse(String(opts.body)).model;
@@ -470,7 +474,7 @@ test("HuggingChat: non-streaming returns JSON completion", async () => {
 
   const original = globalThis.fetch;
   let callCount = 0;
-  globalThis.fetch = async (url: any, opts: any) => {
+  globalThis.fetch = async (url: MockFetchInput, opts?: MockFetchInit) => {
     callCount++;
     if (callCount === 1) {
       return new Response(JSON.stringify({ conversationId: "test-conv-123" }), {
@@ -666,7 +670,7 @@ test("v0 Vercel Web: error response returns error result", async () => {
 
 // ── Kimi Web Execution Tests ─────────────────────────────────────────────────
 
-test("Kimi Web: targets www.kimi.com (international)", async () => {
+test("Kimi Web: targets www.kimi.ai (international)", async () => {
   // The new executor talks to the Connect-RPC streaming endpoint on the
   // international domain. A bare empty credential is rejected before the
   // fetch fires, so we feed a fake JWT and let the mock absorb the request.
@@ -675,16 +679,16 @@ test("Kimi Web: targets www.kimi.com (international)", async () => {
     const executor = new KimiWebExecutor();
     const result = await executor.execute({
       ...noopExecuteInput,
-      model: "kimi-default",
+      model: "k2d6",
       credentials: { apiKey: "kimi-auth=eyJ.eyJzdWI.signature" },
     });
     assert.ok(result.response instanceof Response);
     // Parse the URL and assert on the exact hostname rather than a substring
-    // match — `includes("www.kimi.com")` would also accept a hostile host like
-    // `www.kimi.com.evil.net` or `evil.net/?x=www.kimi.com` (CodeQL
+    // match — `includes("www.kimi.ai")` would also accept a hostile host like
+    // `www.kimi.ai.evil.net` or `evil.net/?x=www.kimi.ai` (CodeQL
     // js/incomplete-url-substring-sanitization).
     const host = new URL(result.url).hostname;
-    assert.equal(host, "www.kimi.com", `got ${result.url}`);
+    assert.equal(host, "www.kimi.ai", `got ${result.url}`);
     assert.notEqual(host, "www.moonshot.cn", `got ${result.url}`);
   } finally {
     restore.restore();
@@ -695,7 +699,7 @@ test("Kimi Web: missing JWT returns a 400 before fetching", async () => {
   const executor = new KimiWebExecutor();
   const result = await executor.execute({
     ...noopExecuteInput,
-    model: "kimi-default",
+    model: "k2d6",
     credentials: { apiKey: "" },
   });
   assert.equal(result.response.status, 400);
@@ -707,7 +711,7 @@ test("Kimi Web: error response returns error result", async () => {
     const executor = new KimiWebExecutor();
     const result = await executor.execute({
       ...noopExecuteInput,
-      model: "kimi-default",
+      model: "k2d6",
       credentials: { apiKey: "kimi-auth=eyJ.eyJzdWI.signature" },
     });
     assert.ok(result.response instanceof Response);
@@ -719,17 +723,51 @@ test("Kimi Web: error response returns error result", async () => {
 
 // ── Doubao Web Execution Tests ───────────────────────────────────────────────
 
-test("Doubao Web: streaming passes through SSE", async () => {
-  const sseData = ['data: {"choices":[{"delta":{"content":"你好世界"}}]}'];
+test("Doubao Web: streaming converts Dola SSE chunks", async () => {
+  const sseData = [
+    'event: STREAM_MSG_NOTIFY\ndata: {"content":{"content_block":[{"content":{"text_block":{"text":"hello"}}}]}}\n\n',
+    'event: STREAM_CHUNK\ndata: {"message_id":"mid","patch_op":[{"patch_value":{"content_block":[{"content":{"text_block":{"text":" world"}}}]}}]}\n\n',
+  ];
   const restore = mockFetchCapture(200, mockSSEStream(sseData));
   try {
     const executor = new DoubaoWebExecutor();
     const result = await executor.execute({
       ...noopExecuteInput,
-      model: "doubao-default",
+      model: "dola-speed",
+      credentials: { apiKey: "sessionid=sid; ttwid=tt; s_v_web_id=verify_abc" },
     });
     assert.ok(result.response instanceof Response);
-    assert.ok(result.url.includes("doubao.com"));
+    assert.equal(new URL(result.url).hostname, "www.dola.com");
+    assert.equal(result.transformedBody.option.need_create_conversation, true);
+    const streamed = await result.response.text();
+    assert.match(streamed, /hello/);
+  } finally {
+    restore.restore();
+  }
+});
+
+test("Doubao Web: Dola Pro returns final answer after reasoning boundary", async () => {
+  const sseData = [
+    'event: STREAM_CHUNK\ndata: {"message_id":"mid","patch_op":[{"patch_object":1,"patch_type":1,"patch_value":{"content_block":[{"block_type":10000,"content":{"text_block":{"text":"The user asked for 1+1. "}},"is_finish":false}]}}]}\n\n',
+    'event: STREAM_CHUNK\ndata: {"message_id":"mid","patch_op":[{"patch_object":1,"patch_type":1,"patch_value":{"content_block":[{"block_type":10000,"content":{"text_block":{"text":"That is straightforward: 2."}},"is_finish":false}]}}]}\n\n',
+    'event: STREAM_CHUNK\ndata: {"message_id":"mid","patch_op":[{"patch_object":1,"patch_type":1,"patch_value":{"content_block":[{"block_type":10040,"content":{"text_block":{}},"is_finish":true}]}}]}\n\n',
+    'event: STREAM_CHUNK\ndata: {"message_id":"mid","patch_op":[{"patch_object":1,"patch_type":1,"patch_value":{"content_block":[{"block_type":10000,"content":{"text_block":{"text":"2"}},"is_finish":false}]}}]}\n\n',
+    'event: SSE_REPLY_END\ndata: {"end_type":1}\n\n',
+  ];
+  const restore = mockFetchCapture(200, mockSSEStream(sseData));
+  try {
+    const executor = new DoubaoWebExecutor();
+    const result = await executor.execute({
+      ...noopExecuteInput,
+      model: "dola-pro",
+      stream: false,
+      credentials: { apiKey: "sessionid=sid; ttwid=tt; s_v_web_id=verify_abc" },
+    });
+    const body = await result.response.json();
+
+    assert.equal(result.transformedBody.option.need_deep_think, 3);
+    assert.equal(result.transformedBody.ext.use_deep_think, "3");
+    assert.equal(body.choices[0].message.content, "2");
   } finally {
     restore.restore();
   }
@@ -739,7 +777,10 @@ test("Doubao Web: error response returns error result", async () => {
   const restore = mockFetchCapture(502, "Bad Gateway");
   try {
     const executor = new DoubaoWebExecutor();
-    const result = await executor.execute(noopExecuteInput);
+    const result = await executor.execute({
+      ...noopExecuteInput,
+      credentials: { apiKey: "sessionid=sid; ttwid=tt; s_v_web_id=verify_abc" },
+    });
     assert.ok(result.response instanceof Response);
     assert.equal(result.response.status, 502);
   } finally {
@@ -761,7 +802,7 @@ test("All executors handle Cookie: prefix", async () => {
 
   const original = globalThis.fetch;
   let lastHeaders: Record<string, string> = {};
-  globalThis.fetch = async (_url: any, opts: any) => {
+  globalThis.fetch = async (_url: MockFetchInput, opts?: MockFetchInit) => {
     lastHeaders = opts?.headers || {};
     // Poe expects JSON response with chatWithBot
     const body = JSON.stringify({ data: { chatWithBot: { text: "ok" } } });
@@ -775,7 +816,7 @@ test("All executors handle Cookie: prefix", async () => {
     for (const executor of executors) {
       await executor.execute({
         ...noopExecuteInput,
-        credentials: { apiKey: "Cookie: test=value" },
+        credentials: { apiKey: "Cookie: sessionid=test; ttwid=tt; s_v_web_id=verify_test" },
         stream: false,
       });
       // Cookie should be normalized (may or may not have prefix depending on executor)
@@ -798,7 +839,7 @@ test("All executors handle bare cookie value", async () => {
 
   const original = globalThis.fetch;
   let lastHeaders: Record<string, string> = {};
-  globalThis.fetch = async (_url: any, opts: any) => {
+  globalThis.fetch = async (_url: MockFetchInput, opts?: MockFetchInit) => {
     lastHeaders = opts?.headers || {};
     // Poe expects JSON response with chatWithBot
     const body = JSON.stringify({ data: { chatWithBot: { text: "ok" } } });
@@ -830,7 +871,7 @@ test("HuggingChat: respects abort signal", async () => {
 
   const original = globalThis.fetch;
   let fetchCalled = false;
-  globalThis.fetch = async (_url: any, _opts: any) => {
+  globalThis.fetch = async (_url: MockFetchInput, _opts?: MockFetchInit) => {
     fetchCalled = true;
     return new Response("ok", { status: 200 });
   };

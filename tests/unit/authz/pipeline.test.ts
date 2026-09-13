@@ -66,6 +66,7 @@ test.beforeEach(() => {
 });
 
 test.after(() => {
+  core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   if (ORIGINAL_JWT === undefined) delete process.env.JWT_SECRET;
   else process.env.JWT_SECRET = ORIGINAL_JWT;
@@ -136,6 +137,50 @@ test("runAuthzPipeline redirects unauthenticated /home/* nested paths to login (
   assert.equal(response.status, 307);
   assert.equal(response.headers.get("location"), "http://localhost/login");
   assert.equal(response.headers.get("x-omniroute-route-class"), "MANAGEMENT");
+});
+
+// PR #1810 (upstream 9router): reverse-proxy subpath deployment via
+// OMNIROUTE_BASE_PATH. Next.js strips the basePath from nextUrl.pathname
+// before route classification, so the redirect targets must re-add it via
+// request.nextUrl.basePath to stay inside the deployed subpath.
+test("runAuthzPipeline prefixes the root-to-dashboard redirect with basePath when set", async () => {
+  await forceAuthRequired();
+
+  const req = new NextRequest("http://localhost/omniroute/", {
+    nextConfig: { basePath: "/omniroute" },
+  });
+
+  const response = await pipeline.runAuthzPipeline(req, { enforce: true });
+
+  assert.equal(response.status, 307);
+  assert.equal(response.headers.get("location"), "http://localhost/omniroute/dashboard");
+});
+
+test("runAuthzPipeline prefixes the dashboard login redirect with basePath when set", async () => {
+  await forceAuthRequired();
+
+  const req = new NextRequest("http://localhost/omniroute/dashboard", {
+    nextConfig: { basePath: "/omniroute" },
+  });
+
+  const response = await pipeline.runAuthzPipeline(req, { enforce: true });
+
+  assert.equal(response.status, 307);
+  assert.equal(response.headers.get("location"), "http://localhost/omniroute/login");
+  assert.equal(response.headers.get("x-omniroute-route-class"), "MANAGEMENT");
+});
+
+test("runAuthzPipeline leaves redirect targets unprefixed when basePath is empty", async () => {
+  await forceAuthRequired();
+
+  const req = new NextRequest("http://localhost/dashboard", {
+    nextConfig: { basePath: "" },
+  });
+
+  const response = await pipeline.runAuthzPipeline(req, { enforce: true });
+
+  assert.equal(response.status, 307);
+  assert.equal(response.headers.get("location"), "http://localhost/login");
 });
 
 test("runAuthzPipeline allows onboarding when login is required but no password exists", async () => {
@@ -261,6 +306,7 @@ test("runAuthzPipeline rejects new API requests during shutdown drain", async ()
 
   assert.equal(response.status, 503);
   assert.equal(body.error.code, "SERVICE_UNAVAILABLE");
+  assert.equal(response.headers.get("retry-after"), "5");
 });
 
 test("runAuthzPipeline rejects rewritten API aliases during shutdown drain", async () => {
@@ -274,6 +320,7 @@ test("runAuthzPipeline rejects rewritten API aliases during shutdown drain", asy
   assert.equal(response.status, 503);
   assert.equal(response.headers.get("x-omniroute-route-class"), "CLIENT_API");
   assert.equal(body.error.code, "SERVICE_UNAVAILABLE");
+  assert.equal(response.headers.get("retry-after"), "5");
 });
 
 test("runAuthzPipeline allows dashboard sessions to read model catalog aliases", async () => {
@@ -519,4 +566,39 @@ test("runAuthzPipeline refreshes dashboard JWTs near expiry", async () => {
 
   assert.equal(response.status, 200);
   assert.match(response.headers.get("set-cookie") || "", /auth_token=/);
+});
+
+test("runAuthzPipeline clears stale dashboard JWTs without error-stack noise", async () => {
+  await forceAuthRequired();
+  const oldSecret = new TextEncoder().encode("old-dashboard-jwt-secret");
+  const staleToken = await new SignJWT({ authenticated: true })
+    .setProtectedHeader({ alg: "HS256" })
+    .setExpirationTime("1h")
+    .sign(oldSecret);
+
+  const errorCalls: unknown[][] = [];
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  console.error = (...args: unknown[]) => {
+    errorCalls.push(args);
+  };
+  console.warn = () => {};
+
+  try {
+    const response = await pipeline.runAuthzPipeline(
+      request("http://localhost/dashboard", {
+        headers: { cookie: `auth_token=${staleToken}` },
+      }),
+      { enforce: true }
+    );
+
+    assert.equal(response.status, 307);
+    const setCookie = response.headers.get("set-cookie") || "";
+    assert.match(setCookie, /auth_token=/);
+    assert.match(setCookie, /Max-Age=0|Expires=/i);
+    assert.equal(errorCalls.length, 0);
+  } finally {
+    console.error = originalError;
+    console.warn = originalWarn;
+  }
 });

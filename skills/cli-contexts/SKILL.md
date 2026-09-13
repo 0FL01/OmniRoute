@@ -227,6 +227,9 @@ Add a new context
 
 - `--api-key <k>`
 - `--api-key-stdin`
+- `--access-token <t>`
+- `--access-token-stdin`
+- `--scope <s>`
 - `--description <d>`
 
 **Example:**
@@ -247,7 +250,11 @@ omniroute contexts use <name>
 
 ### `contexts current`
 
-Show current active context name
+Show the active context (server, auth, scope)
+
+**Flags:**
+
+- `--name-only`
 
 **Example:**
 
@@ -316,6 +323,20 @@ Import contexts from a JSON file
 
 ```bash
 omniroute contexts import <file>
+```
+
+### `contexts migrate`
+
+Move legacy plaintext context credentials to the OS keychain
+
+**Flags:**
+
+- `--yes`
+
+**Example:**
+
+```bash
+omniroute contexts migrate
 ```
 
 ### `sessions`

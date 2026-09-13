@@ -5,20 +5,21 @@ import {
   getComboModelString,
   getComboStepTarget,
 } from "../../src/lib/combos/steps.ts";
-
 import { registerToolSearchTool } from "./toolSearch/register.ts";
-
 import {
   MCP_TOOLS,
   getHealthInput,
   listCombosInput,
   getComboMetricsInput,
   switchComboInput,
+  createComboInput,
   checkQuotaInput,
   routeRequestInput,
   costReportInput,
   listModelsCatalogInput,
   webSearchInput,
+  buildWebSearchInputSchema,
+  xSearchInput,
   webFetchInput,
   simulateRouteInput,
   setBudgetGuardInput,
@@ -28,6 +29,7 @@ import {
   getProviderMetricsInput,
   bestComboForTaskInput,
   explainRouteInput,
+  pickFastestModelInput,
   getSessionSnapshotInput,
   dbHealthCheckInput,
   syncPricingInput,
@@ -38,7 +40,7 @@ import {
   oneproxyStatsInput,
 } from "./schemas/tools.ts";
 import { startMcpHeartbeat } from "./runtimeHeartbeat.ts";
-
+import { countUniqueMcpTools } from "./toolCount.ts";
 import { z } from "zod";
 import { closeAuditDb, logToolCall } from "./audit.ts";
 import {
@@ -47,7 +49,7 @@ import {
   type McpToolExtraLike,
 } from "./scopeEnforcement.ts";
 import { getMcpHttpAuthHeadersForInternalFetch } from "./httpAuthContext.ts";
-
+import { getInternalServiceAuthHeaders } from "../../src/lib/api/internalServiceAuth.ts";
 import {
   handleSimulateRoute,
   handleSetBudgetGuard,
@@ -66,9 +68,11 @@ import {
   handleOneproxyRotate,
   handleOneproxyStats,
 } from "./tools/advancedTools.ts";
+import { handlePickFastestModel } from "./tools/pickFastestModel.ts";
 import { memoryTools } from "./tools/memoryTools.ts";
 import { skillTools } from "./tools/skillTools.ts";
 import { agentSkillTools } from "./tools/agentSkillTools.ts";
+import { githubSkillTools } from "./tools/githubSkillTools.ts";
 import { skillRegistry } from "../../src/lib/skills/registry.ts";
 import { skillExecutor } from "../../src/lib/skills/executor.ts";
 import { pluginTools } from "./tools/pluginTools.ts";
@@ -77,6 +81,7 @@ import { poolTools } from "./tools/poolTools.ts";
 import { gamificationTools } from "./tools/gamificationTools.ts";
 import { notionTools } from "./tools/notionTools.ts";
 import { obsidianTools } from "./tools/obsidianTools.ts";
+import { localCorpusTools } from "./tools/localCorpusTools.ts";
 import { compressMcpRegistryMetadata } from "./descriptionCompressor.ts";
 import { reduceToolManifest, readMcpToolProfileFromEnv } from "./toolCardinality.ts";
 import { smartFilterText } from "../services/compression/engines/mcpAccessibility/index.ts";
@@ -86,11 +91,14 @@ import {
   type McpAccessibilityConfig,
 } from "../services/compression/engines/mcpAccessibility/constants.ts";
 import { getDbInstance } from "../../src/lib/db/core.ts";
-import { getProviderConnections } from "../../src/lib/db/providers.ts";
-import { getCodexRequestDefaults } from "../../src/lib/providers/requestDefaults.ts";
 import { normalizeQuotaResponse } from "../../src/shared/contracts/quota.ts";
-import { AI_PROVIDERS, NOAUTH_PROVIDERS } from "../../src/shared/constants/providers.ts";
 import { resolveOmniRouteBaseUrl } from "../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
+import { sanitizeErrorMessage } from "../utils/error.ts";
+import { mcpFetchTimeoutSignal } from "./fetchTimeout.ts";
+import { getMcpModelsCatalog } from "./catalog.ts";
+import { registerRadarCatalogTool } from "./radarCatalog.ts";
+import type { TextToolResult } from "./toolResult.ts";
+export { getMcpModelsCatalog } from "./catalog.ts";
 
 const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
 const MCP_ENFORCE_SCOPES = process.env.OMNIROUTE_MCP_ENFORCE_SCOPES === "true";
@@ -100,16 +108,20 @@ const MCP_ALLOWED_SCOPES = new Set(
     .map((s) => s.trim())
     .filter(Boolean)
 );
-const TOTAL_MCP_TOOL_COUNT =
-  MCP_TOOLS.length +
-  Object.keys(memoryTools).length +
-  Object.keys(skillTools).length +
-  Object.keys(agentSkillTools).length +
-  Object.keys(poolTools).length +
-  gamificationTools.length +
-  pluginTools.length +
-  notionTools.length +
-  obsidianTools.length;
+const TOTAL_MCP_TOOL_COUNT = countUniqueMcpTools({
+  MCP_TOOLS,
+  memoryTools,
+  skillTools,
+  agentSkillTools,
+  githubSkillTools,
+  poolTools,
+  gamificationTools,
+  pluginTools,
+  notionTools,
+  obsidianTools,
+  localCorpusTools,
+  compressionTools,
+});
 
 type JsonRecord = Record<string, unknown>;
 
@@ -139,33 +151,6 @@ function readMcpAccessibilityConfig(): McpAccessibilityConfig {
   }
 }
 
-type TextToolResult = {
-  content: Array<{ type: "text"; text: string }>;
-  isError?: boolean;
-};
-
-type McpCatalogStatus = "available" | "degraded" | "unavailable";
-
-type McpCatalogResponse = {
-  models: Array<{
-    id: string;
-    provider: string;
-    capabilities: string[];
-    status: McpCatalogStatus;
-    thinkingEffort?: string;
-    pricing?: unknown;
-  }>;
-  source: string;
-  warning?: string;
-};
-
-type ProviderConnectionLike = {
-  id?: string;
-  provider?: string;
-  isActive?: boolean;
-  providerSpecificData?: unknown;
-};
-
 function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
@@ -180,6 +165,12 @@ function toString(value: unknown, fallback = ""): string {
 
 function toNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+// Mirrors the runtime's env convention for lane flags ("1" | "true" are on) so a
+// future string serialization can never silently invert a boolean lane report.
+function isLaneFlagOn(value: unknown): boolean {
+  return value === true || value === "1" || value === "true";
 }
 
 function toStringArray(value: unknown, fallback: string[] = []): string[] {
@@ -210,7 +201,7 @@ function getOmniRouteApiKey(): string {
   return process.env.OMNIROUTE_API_KEY || "";
 }
 
-async function omniRouteFetch(path: string, options: RequestInit = {}): Promise<unknown> {
+export async function omniRouteFetch(path: string, options: RequestInit = {}): Promise<unknown> {
   const url = `${OMNIROUTE_BASE_URL}${path}`;
   const apiKey = getOmniRouteApiKey();
   const headers: Record<string, string> = {
@@ -220,9 +211,12 @@ async function omniRouteFetch(path: string, options: RequestInit = {}): Promise<
     ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     ...getMcpHttpAuthHeadersForInternalFetch(),
     ...((options.headers as Record<string, string>) || {}),
+    // Authenticate only the server-to-server hop. This does not replace or
+    // weaken the caller identity forwarded above.
+    ...getInternalServiceAuthHeaders(),
   };
 
-  const signal = options.signal || AbortSignal.timeout(10000);
+  const signal = options.signal || mcpFetchTimeoutSignal("management");
   const response = await fetch(url, { ...options, headers, signal });
 
   if (!response.ok) {
@@ -231,202 +225,6 @@ async function omniRouteFetch(path: string, options: RequestInit = {}): Promise<
   }
 
   return response.json();
-}
-
-function buildProviderAliasMap(): Record<string, string> {
-  const aliasMap: Record<string, string> = {};
-
-  for (const provider of Object.values(AI_PROVIDERS)) {
-    if (!provider?.id) continue;
-    aliasMap[provider.id] = provider.id;
-    if (typeof provider.alias === "string" && provider.alias.length > 0) {
-      aliasMap[provider.alias] = provider.id;
-    }
-  }
-
-  for (const provider of Object.values(NOAUTH_PROVIDERS)) {
-    if (!provider?.id) continue;
-    aliasMap[provider.id] = provider.id;
-    if ("alias" in provider && typeof provider.alias === "string" && provider.alias.length > 0) {
-      aliasMap[provider.alias] = provider.id;
-    }
-  }
-
-  return aliasMap;
-}
-
-function normalizeCapability(value: string): string {
-  switch (value) {
-    case "embeddings":
-      return "embedding";
-    case "images":
-      return "image";
-    case "videos":
-      return "video";
-    case "moderations":
-      return "moderation";
-    case "chat-completions":
-      return "chat";
-    default:
-      return value;
-  }
-}
-
-function getCatalogModelCapabilities(model: JsonRecord): string[] {
-  if (Array.isArray(model.capabilities) && model.capabilities.length > 0) {
-    return toStringArray(model.capabilities, ["chat"]).map(normalizeCapability);
-  }
-
-  if (Array.isArray(model.supportedEndpoints) && model.supportedEndpoints.length > 0) {
-    return toStringArray(model.supportedEndpoints, ["chat"]).map(normalizeCapability);
-  }
-
-  const type = toString(model.type);
-  if (type) return [normalizeCapability(type)];
-
-  return ["chat"];
-}
-
-function normalizeCatalogStatus(
-  model: JsonRecord,
-  source: string,
-  warning?: string
-): McpCatalogStatus {
-  const explicitStatus = toString(model.status);
-  if (
-    explicitStatus === "available" ||
-    explicitStatus === "degraded" ||
-    explicitStatus === "unavailable"
-  ) {
-    return explicitStatus;
-  }
-
-  if (warning || source === "local_catalog") return "degraded";
-  return "available";
-}
-
-function getConnectionThinkingEffort(connection: ProviderConnectionLike): string | undefined {
-  const provider = typeof connection.provider === "string" ? connection.provider : null;
-  const providerSpecificData = toRecord(connection.providerSpecificData);
-
-  if (provider === "codex") {
-    return getCodexRequestDefaults(providerSpecificData).reasoningEffort || "medium";
-  }
-
-  const rawThinkingEffort = toString(providerSpecificData.thinkingEffort);
-  return rawThinkingEffort || undefined;
-}
-
-function normalizeProviderModelRecord(
-  rawModel: unknown,
-  fallbackProvider: string,
-  source: string,
-  warning?: string,
-  thinkingEffort?: string
-) {
-  const model = toRecord(rawModel);
-  const id = toString(model.id, "");
-
-  return {
-    id,
-    provider: toString(model.owned_by, toString(model.provider, fallbackProvider)),
-    capabilities: getCatalogModelCapabilities(model),
-    status: normalizeCatalogStatus(model, source, warning),
-    ...(thinkingEffort ? { thinkingEffort } : {}),
-    pricing: model.pricing,
-  };
-}
-
-export async function getMcpModelsCatalog(
-  args: { provider?: string; capability?: string },
-  deps: {
-    fetchJson?: (path: string) => Promise<unknown>;
-    listProviderConnections?: () => Promise<ProviderConnectionLike[]>;
-  } = {}
-): Promise<McpCatalogResponse> {
-  const fetchJson = deps.fetchJson ?? ((path: string) => omniRouteFetch(path));
-  const listProviderConnections = deps.listProviderConnections ?? getProviderConnections;
-  const aliasMap = buildProviderAliasMap();
-  const normalizeProviderId = (value: string) => aliasMap[value] || value;
-  const requestedProvider = args.provider ? normalizeProviderId(args.provider) : null;
-  const requestedCapability = args.capability ? normalizeCapability(args.capability) : null;
-
-  let connections = await listProviderConnections();
-  connections = Array.isArray(connections) ? connections : [];
-
-  const activeConnections = connections.filter((connection) => {
-    const provider =
-      typeof connection?.provider === "string" ? normalizeProviderId(connection.provider) : null;
-    if (!provider || !connection?.id || connection.isActive === false) return false;
-    if (requestedProvider && provider !== requestedProvider) return false;
-    return true;
-  });
-
-  const requestSpecs = activeConnections.map((connection) => ({
-    provider: normalizeProviderId(String(connection.provider)),
-    path: `/api/providers/${encodeURIComponent(String(connection.id))}/models?excludeHidden=true`,
-    thinkingEffort: getConnectionThinkingEffort(connection),
-  }));
-
-  if (requestedProvider && requestSpecs.length === 0) {
-    const isNoAuthProvider = Object.values(NOAUTH_PROVIDERS).some(
-      (provider) => provider.id === requestedProvider
-    );
-    if (isNoAuthProvider) {
-      requestSpecs.push({
-        provider: requestedProvider,
-        path: `/api/v1/providers/${encodeURIComponent(requestedProvider)}/models`,
-        thinkingEffort: undefined,
-      });
-    } else {
-      return {
-        models: [],
-        source: "provider_connections",
-        warning: `No active connections found for provider '${requestedProvider}'.`,
-      };
-    }
-  }
-
-  const collectedModels = new Map<string, McpCatalogResponse["models"][number]>();
-  const warnings = new Set<string>();
-  const sources = new Set<string>();
-
-  for (const spec of requestSpecs) {
-    const raw = toRecord(await fetchJson(spec.path));
-    const source = toString(
-      raw.source,
-      spec.path.startsWith("/api/providers/") ? "api" : "v1_catalog"
-    );
-    const warning = raw.warning ? String(raw.warning) : undefined;
-    if (warning) warnings.add(warning);
-    sources.add(source);
-
-    const rawModels = Array.isArray(raw.models)
-      ? raw.models
-      : Array.isArray(raw.data)
-        ? raw.data
-        : [];
-
-    for (const rawModel of rawModels) {
-      const normalized = normalizeProviderModelRecord(rawModel, spec.provider, source, warning);
-      if (spec.thinkingEffort && !normalized.thinkingEffort) {
-        normalized.thinkingEffort = spec.thinkingEffort;
-      }
-      if (!normalized.id) continue;
-      if (requestedCapability && !normalized.capabilities.includes(requestedCapability)) continue;
-
-      const key = `${normalized.provider}:${normalized.id}`;
-      if (!collectedModels.has(key)) {
-        collectedModels.set(key, normalized);
-      }
-    }
-  }
-
-  return {
-    models: [...collectedModels.values()],
-    source: sources.size === 1 ? [...sources][0] : "aggregated_provider_models",
-    ...(warnings.size > 0 ? { warning: [...warnings].join(" | ") } : {}),
-  };
 }
 
 function withScopeEnforcement(
@@ -478,6 +276,15 @@ function withScopeEnforcement(
   };
 }
 
+// process.uptime() (the source of health.uptime) returns a number, not a string;
+// the shared toString() helper only passes through actual strings, so a naive
+// toString(health.uptime, "unknown") silently discarded every real uptime value.
+function toUptimeString(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return "unknown";
+}
+
 async function handleGetHealth() {
   const start = Date.now();
   try {
@@ -494,9 +301,40 @@ async function handleGetHealth() {
     const cacheStatsRaw = toRecord(health.cacheStats);
     const resilienceCircuitBreakers = toArray(resilience.circuitBreakers);
     const rateLimitEntries = toArray(rateLimits.limits);
+    const adaptiveAdmissionRaw = toRecord(health.adaptiveAdmission);
+    // Curated lane subset: top lanes by queued cost so a congested tenant is
+    // visible first without shipping the whole admission snapshot to agents.
+    const laneTenants = toArray(adaptiveAdmissionRaw.laneTenants)
+      .map((tenant) => {
+        const record = toRecord(tenant);
+        return {
+          tenantKey: toString(record.tenantKey),
+          queuedCount: toNumber(record.queuedCount, 0),
+          queuedCost: toNumber(record.queuedCost, 0),
+        };
+      })
+      .sort((a, b) => b.queuedCost - a.queuedCost)
+      .slice(0, 10);
+
+    // Surface fetch failures instead of letting Promise.allSettled's {} fallback
+    // masquerade as genuine zero/empty data (indistinguishable "no data" vs.
+    // "couldn't reach the source" was the actual root confusion this fixes).
+    const degradedSources: Array<{ source: string; settled: PromiseSettledResult<unknown> }> = [
+      { source: "health", settled: healthRaw },
+      { source: "resilience", settled: resilienceRaw },
+      { source: "rateLimits", settled: rateLimitsRaw },
+    ];
+    const degraded = degradedSources
+      .filter(({ settled }) => settled.status === "rejected")
+      .map(({ source, settled }) => ({
+        source,
+        error: sanitizeErrorMessage(
+          settled.status === "rejected" ? (settled as PromiseRejectedResult).reason : undefined
+        ),
+      }));
 
     const result = {
-      uptime: toString(health.uptime, "unknown"),
+      uptime: toUptimeString(health.uptime),
       version: toString(health.version, "unknown"),
       memoryUsage: {
         heapUsed: toNumber(memoryUsageRaw.heapUsed, 0),
@@ -518,6 +356,23 @@ async function handleGetHealth() {
             provider: toString(toRecord(health.cryptography).provider, "unknown"),
           }
         : undefined,
+      adaptiveAdmission:
+        Object.keys(adaptiveAdmissionRaw).length > 0
+          ? {
+              virtualLanes: isLaneFlagOn(adaptiveAdmissionRaw.virtualLanes),
+              pressure: toString(adaptiveAdmissionRaw.pressure),
+              utilization: toNumber(adaptiveAdmissionRaw.utilization, 0),
+              laneCount: toNumber(adaptiveAdmissionRaw.laneCount, 0),
+              laneQueuedCount: toNumber(adaptiveAdmissionRaw.laneQueuedCount, 0),
+              laneQueuedCost: toNumber(adaptiveAdmissionRaw.laneQueuedCost, 0),
+              laneTenants,
+              admittedCount: toNumber(adaptiveAdmissionRaw.admittedCount, 0),
+              rejectedCount: toNumber(adaptiveAdmissionRaw.rejectedCount, 0),
+              wouldRejectCount: toNumber(adaptiveAdmissionRaw.wouldRejectCount, 0),
+              shutdown: isLaneFlagOn(adaptiveAdmissionRaw.shutdown),
+            }
+          : undefined,
+      degraded: degraded.length > 0 ? degraded : undefined,
     };
 
     await logToolCall("omniroute_get_health", {}, result, Date.now() - start, true);
@@ -602,6 +457,27 @@ async function handleSwitchCombo(args: { comboId: string; active: boolean }) {
   }
 }
 
+async function handleCreateCombo(args: {
+  name: string;
+  description?: string;
+  strategy?: string;
+  models: { provider: string; model: string }[];
+}) {
+  const start = Date.now();
+  try {
+    const result = await omniRouteFetch("/api/combos", {
+      method: "POST",
+      body: JSON.stringify(args),
+    });
+    await logToolCall("omniroute_create_combo", args, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await logToolCall("omniroute_create_combo", args, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
 async function handleCheckQuota(args: { provider?: string; connectionId?: string }) {
   const start = Date.now();
   try {
@@ -645,6 +521,10 @@ async function handleRouteRequest(args: {
     const raw = (await omniRouteFetch("/v1/chat/completions", {
       method: "POST",
       body: JSON.stringify(body),
+      // #9717: this hop waits on an upstream provider (and on auto-combo
+      // candidate probing before one is even chosen), so it must not inherit
+      // the management-read budget.
+      signal: mcpFetchTimeoutSignal("upstream"),
     })) as JsonRecord;
     const choices = toArray(raw.choices);
     const firstChoice = toRecord(choices[0]);
@@ -761,16 +641,7 @@ async function handleWebSearch(args: {
   query: string;
   max_results?: number;
   search_type?: "web" | "news";
-  provider?:
-    | "serper-search"
-    | "brave-search"
-    | "perplexity-search"
-    | "exa-search"
-    | "tavily-search"
-    | "google-pse-search"
-    | "linkup-search"
-    | "searchapi-search"
-    | "searxng-search";
+  provider?: string;
 }) {
   const start = Date.now();
   try {
@@ -784,7 +655,7 @@ async function handleWebSearch(args: {
     const result = await omniRouteFetch("/v1/search", {
       method: "POST",
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60000),
+      signal: mcpFetchTimeoutSignal("upstream"),
     });
     await logToolCall("omniroute_web_search", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
@@ -795,9 +666,31 @@ async function handleWebSearch(args: {
   }
 }
 
+async function handleXSearch(args: { query: string; max_results?: number }) {
+  const start = Date.now();
+  try {
+    const result = await omniRouteFetch("/v1/search", {
+      method: "POST",
+      body: JSON.stringify({
+        query: args.query,
+        max_results: args.max_results ?? 5,
+        search_type: "x",
+        provider: "x-search",
+      }),
+      signal: AbortSignal.timeout(120000),
+    });
+    await logToolCall("omniroute_x_search", args, result, Date.now() - start, true);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await logToolCall("omniroute_x_search", args, null, Date.now() - start, false, msg);
+    return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+  }
+}
+
 async function handleWebFetch(args: {
   url: string;
-  provider?: "firecrawl" | "jina-reader" | "tavily-search";
+  provider?: "firecrawl" | "jina-reader" | "tavily-search" | "tinyfish" | "context7";
   format?: "markdown" | "html" | "links" | "screenshot";
   include_metadata?: boolean;
   depth?: number;
@@ -817,7 +710,7 @@ async function handleWebFetch(args: {
     const result = await omniRouteFetch("/v1/web/fetch", {
       method: "POST",
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60000),
+      signal: mcpFetchTimeoutSignal("upstream"),
     });
     await logToolCall("omniroute_web_fetch", args, result, Date.now() - start, true);
     return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
@@ -828,7 +721,24 @@ async function handleWebFetch(args: {
   }
 }
 
-export function createMcpServer(): McpServer {
+export interface CreateMcpServerOptions {
+  blockedProviders?: string[] | (() => string[]);
+}
+
+export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
+  const resolveBlockedProviders = (): string[] => {
+    if (typeof options?.blockedProviders === "function") {
+      return options.blockedProviders();
+    }
+    if (Array.isArray(options?.blockedProviders)) {
+      return options.blockedProviders;
+    }
+    return [];
+  };
+
+  const blockedProviders = resolveBlockedProviders();
+  const dynamicWebSearchInput = buildWebSearchInputSchema(blockedProviders);
+
   const server = new McpServer({
     name: "omniroute",
     version: process.env.npm_package_version || "1.8.1",
@@ -897,6 +807,7 @@ export function createMcpServer(): McpServer {
     ...gamificationTools.map((t) => t.name),
     ...obsidianTools.map((t) => t.name),
     ...notionTools.map((t) => t.name),
+    ...localCorpusTools.map((t) => t.name),
   ]);
 
   server.registerTool(
@@ -947,6 +858,17 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "omniroute_create_combo",
+    {
+      description: "Registers a new combo (model chain) with name, models, and strategy",
+      inputSchema: createComboInput,
+    },
+    withScopeEnforcement("omniroute_create_combo", (args) =>
+      handleCreateCombo(createComboInput.parse(args))
+    )
+  );
+
+  server.registerTool(
     "omniroute_check_quota",
     {
       description: "Checks remaining API quota for one or all providers",
@@ -989,6 +911,8 @@ export function createMcpServer(): McpServer {
       handleListModelsCatalog(listModelsCatalogInput.parse(args))
     )
   );
+
+  registerRadarCatalogTool(server, withScopeEnforcement);
 
   server.registerTool(
     "omniroute_simulate_route",
@@ -1086,6 +1010,17 @@ export function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "omniroute_pick_fastest_model",
+    {
+      description: "Picks the fastest reliable provider-model pair from live telemetry.",
+      inputSchema: pickFastestModelInput,
+    },
+    withScopeEnforcement("omniroute_pick_fastest_model", (args) =>
+      handlePickFastestModel(pickFastestModelInput.parse(args))
+    )
+  );
+
+  server.registerTool(
     "omniroute_get_session_snapshot",
     {
       description:
@@ -1127,11 +1062,25 @@ export function createMcpServer(): McpServer {
     {
       description:
         "Performs a web search using OmniRoute's search gateway. Supports multiple providers (Serper, Brave, Perplexity, Exa, Tavily) with automatic failover. Returns search results with titles, URLs, snippets, and position data.",
-      inputSchema: webSearchInput,
+      inputSchema: dynamicWebSearchInput,
     },
     withScopeEnforcement("omniroute_web_search", (args) =>
-      handleWebSearch(webSearchInput.parse(args))
+      // Resolve per invocation (not the startup snapshot above) so a resolver
+      // function passed via CreateMcpServerOptions sees policy changes without
+      // a server rebuild. The advertised inputSchema stays a creation-time
+      // snapshot — MCP clients fetch it once at tools/list.
+      handleWebSearch(buildWebSearchInputSchema(resolveBlockedProviders()).parse(args))
     )
+  );
+
+  server.registerTool(
+    "omniroute_x_search",
+    {
+      description:
+        "Search X (Twitter) through OmniRoute using SuperGrok / xAI server-side x_search. Requires xai-oauth or an xAI API key. Not web search.",
+      inputSchema: xSearchInput,
+    },
+    withScopeEnforcement("omniroute_x_search", (args) => handleXSearch(xSearchInput.parse(args)))
   );
 
   server.registerTool(
@@ -1215,11 +1164,11 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore - handler type lost through dynamic Object.values() access
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -1242,11 +1191,11 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore - handler type lost through dynamic Object.values() access
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -1267,17 +1216,44 @@ export function createMcpServer(): McpServer {
         // @ts-ignore: dynamic zod access
         inputSchema: toolDef.inputSchema,
       },
-      withScopeEnforcement(toolDef.name, async (args) => {
+      withScopeEnforcement(toolDef.name, async (args, extra) => {
         try {
           const parsedArgs = toolDef.inputSchema.parse(args ?? {});
           // @ts-expect-error - handler type lost through dynamic Object.values() access
-          const result = await toolDef.handler(parsedArgs);
+          const result = await toolDef.handler(parsedArgs, extra);
           return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
         }
       })
+    );
+  });
+
+  // ── GitHub Skill Tools ──────────────────────────
+  Object.values(githubSkillTools).forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-expect-error - handler type lost through dynamic Object.values() access
+            const result = await toolDef.handler(parsedArgs);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
     );
   });
 
@@ -1292,11 +1268,11 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -1319,11 +1295,11 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore - handler type lost through dynamic Object.values() access
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -1344,7 +1320,7 @@ export function createMcpServer(): McpServer {
       description: string;
       scopes: readonly string[];
       inputSchema: { parse: (input: unknown) => unknown };
-      handler: (parsedArgs: unknown) => Promise<unknown>;
+      handler: (parsedArgs: unknown, extra?: unknown) => Promise<unknown>;
     }) => {
       server.registerTool(
         toolDef.name,
@@ -1355,10 +1331,10 @@ export function createMcpServer(): McpServer {
         },
         withScopeEnforcement(
           toolDef.name,
-          async (args) => {
+          async (args, extra) => {
             try {
               const parsedArgs = toolDef.inputSchema.parse(args ?? {});
-              const result = await toolDef.handler(parsedArgs);
+              const result = await toolDef.handler(parsedArgs, extra);
               return {
                 content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
               };
@@ -1384,11 +1360,11 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -1411,15 +1387,44 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+          }
+        },
+        toolDef.scopes
+      )
+    );
+  });
+
+  // ── Local Corpus Context Source Tools ─────────
+  localCorpusTools.forEach((toolDef) => {
+    server.registerTool(
+      toolDef.name,
+      {
+        description: toolDef.description,
+        // @ts-ignore: dynamic zod access
+        inputSchema: toolDef.inputSchema,
+      },
+      withScopeEnforcement(
+        toolDef.name,
+        async (args, extra) => {
+          try {
+            const parsedArgs = toolDef.inputSchema.parse(args ?? {});
+            // @ts-ignore: handler expected specific object
+            const result = await toolDef.handler(parsedArgs, extra);
+            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+          } catch (error) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${sanitizeErrorMessage(error)}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -1438,11 +1443,11 @@ export function createMcpServer(): McpServer {
       },
       withScopeEnforcement(
         toolDef.name,
-        async (args) => {
+        async (args, extra) => {
           try {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
-            const result = await toolDef.handler(parsedArgs);
+            const result = await toolDef.handler(parsedArgs, extra);
             return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -1511,6 +1516,10 @@ export function createMcpServer(): McpServer {
  * Called when `omniroute --mcp` is used.
  */
 export async function startMcpStdio(): Promise<void> {
+  // Stdout is reserved for JSON-RPC — bin/mcpStdioConsoleGuard.mjs is preloaded via
+  // `node --import` (see bin/mcp-server.mjs) so console.log/warn already redirect to
+  // stderr before this module's own imports evaluate (DB init happens as a side effect of
+  // createMcpServer()'s tool registration, earlier than any code placed here could catch).
   const server = createMcpServer();
   const transport = new StdioServerTransport();
   const version = process.env.npm_package_version || "1.8.1";

@@ -8,11 +8,13 @@ import {
   KiroOAuthWrapper,
   CursorAuthModal,
   TraeAuthModal,
+  RaycastAuthModal,
   ProxyConfigModal,
 } from "@/shared/components";
 import RiskNoticeModal from "../../components/RiskNoticeModal";
 import CodexCliGuideModal from "../../components/CodexCliGuideModal";
 import SiliconFlowEndpointModal from "./SiliconFlowEndpointModal";
+import KimiCodeAuthMethodModal from "./KimiCodeAuthMethodModal";
 import AddApiKeyModal from "./modals/AddApiKeyModal";
 import EditConnectionModal from "./modals/EditConnectionModal";
 import EditCompatibleNodeModal from "./modals/EditCompatibleNodeModal";
@@ -25,12 +27,16 @@ import { ImportClaudeAuthModal, ApplyClaudeAuthModal } from "./modals/ImportClau
 import ImportGrokCliAuthModal from "./modals/ImportGrokCliAuthModal";
 import { type ConnectionRowConnection } from "./ConnectionRow";
 import { type BatchTestResults } from "../hooks/useProviderConnections";
+import { type ConnectionDeleteConfirmState } from "../hooks/useConnectionDeleteConfirm";
 import { type ImportProgress } from "../hooks/useModelImportHandlers";
-import type { ProviderMessageTranslator } from "../providerPageHelpers";
+import { providerText, type ProviderMessageTranslator } from "../providerPageHelpers";
+import { resolveProviderOAuthBackendId } from "../../providerPageUtils";
 
 interface ProviderInfo {
   name: string;
+  oauthProviderId?: string;
   riskNoticeVariant?: string;
+  website?: string;
   [key: string]: unknown;
 }
 
@@ -49,10 +55,14 @@ interface ProviderModalsPanelProps {
   isCommandCode: boolean;
   isUpstreamProxyProvider: boolean;
   subscriptionRisk: boolean;
+  existingConnectionCount?: number;
   // Risk notice
   showRiskNoticeModal: boolean;
   handleConfirmRiskNotice: () => void;
   handleCancelRiskNotice: () => void;
+  // Provider-specific auth method selection
+  showKimiAuthMethodModal: boolean;
+  setShowKimiAuthMethodModal: (open: boolean) => void;
   // OAuth
   showOAuthModal: boolean;
   reauthConnection: ConnectionRowConnection | null;
@@ -76,6 +86,8 @@ interface ProviderModalsPanelProps {
   handleBatchDeleteConfirm: () => void;
   selectedIds: Set<string>;
   batchDeleting: boolean;
+  // Single-connection delete confirm
+  deleteConfirm: ConnectionDeleteConfirmState;
   // Codex auth
   applyCodexModalConnectionId: string | null;
   setApplyCodexModalConnectionId: (id: string | null) => void;
@@ -145,9 +157,12 @@ export default function ProviderModalsPanel({
   isCcCompatible,
   isUpstreamProxyProvider,
   subscriptionRisk,
+  existingConnectionCount,
   showRiskNoticeModal,
   handleConfirmRiskNotice,
   handleCancelRiskNotice,
+  showKimiAuthMethodModal,
+  setShowKimiAuthMethodModal,
   showOAuthModal,
   reauthConnection,
   handleOAuthSuccess,
@@ -168,6 +183,7 @@ export default function ProviderModalsPanel({
   handleBatchDeleteConfirm,
   selectedIds,
   batchDeleting,
+  deleteConfirm,
   applyCodexModalConnectionId,
   setApplyCodexModalConnectionId,
   applyingCodexAuthId,
@@ -214,6 +230,8 @@ export default function ProviderModalsPanel({
   setShowTutorialModal,
   t,
 }: ProviderModalsPanelProps) {
+  const oauthProviderId = resolveProviderOAuthBackendId(providerId, providerInfo);
+
   return (
     <>
       {showRiskNoticeModal && subscriptionRisk && (
@@ -223,6 +241,21 @@ export default function ProviderModalsPanel({
           providerName={providerInfo.name}
           onConfirm={handleConfirmRiskNotice}
           onCancel={handleCancelRiskNotice}
+        />
+      )}
+      {providerId === "kimi-coding" && (
+        <KimiCodeAuthMethodModal
+          isOpen={showKimiAuthMethodModal}
+          onSelectOAuth={() => {
+            setShowKimiAuthMethodModal(false);
+            setShowOAuthModal(true);
+          }}
+          onSelectApiKey={() => {
+            setShowKimiAuthMethodModal(false);
+            setShowAddApiKeyModal(true);
+          }}
+          onClose={() => setShowKimiAuthMethodModal(false)}
+          t={t}
         />
       )}
       {!isUpstreamProxyProvider &&
@@ -248,11 +281,18 @@ export default function ProviderModalsPanel({
             onSuccess={handleOAuthSuccess}
             onClose={() => setShowOAuthModal(false)}
           />
+        ) : providerId === "raycast" ? (
+          <RaycastAuthModal
+            isOpen={showOAuthModal}
+            reauthConnection={reauthConnection}
+            onSuccess={handleOAuthSuccess}
+            onClose={() => setShowOAuthModal(false)}
+          />
         ) : (
           <OAuthModal
             isOpen={showOAuthModal}
             reauthConnection={reauthConnection}
-            provider={providerId}
+            provider={oauthProviderId}
             providerInfo={providerInfo}
             onSuccess={handleOAuthSuccess}
             onClose={() => setShowOAuthModal(false)}
@@ -277,7 +317,9 @@ export default function ProviderModalsPanel({
           isOpen={showAddApiKeyModal}
           provider={providerId}
           providerName={providerInfo.name}
+          providerWebsite={providerInfo.website}
           initialBaseUrl={siliconFlowInitialBaseUrl}
+          existingConnectionCount={existingConnectionCount}
           isCompatible={isCompatible}
           isAnthropic={isAnthropicProtocolCompatible}
           isCcCompatible={isCcCompatible}
@@ -298,6 +340,21 @@ export default function ProviderModalsPanel({
         cancelText={t("cancel", "Cancel")}
         loading={batchDeleting}
       />
+      <ConfirmModal
+        isOpen={!!deleteConfirm.connection}
+        onClose={deleteConfirm.cancel}
+        onConfirm={deleteConfirm.confirm}
+        title={providerText(t, "deleteConnectionConfirm", "Delete this connection?")}
+        message={providerText(
+          t,
+          "deleteConnectionConfirmNamed",
+          "Are you sure you want to delete {name}? This action cannot be undone.",
+          { name: deleteConfirm.connection?.name ?? "" }
+        )}
+        confirmText={providerText(t, "batchDeleteConfirmButton", "Delete")}
+        cancelText={providerText(t, "cancel", "Cancel")}
+        loading={deleteConfirm.deleting}
+      />
       {providerId === "codex" && applyCodexModalConnectionId && (
         <ApplyCodexAuthModal
           key={applyCodexModalConnectionId}
@@ -312,6 +369,7 @@ export default function ProviderModalsPanel({
           isOpen={showEditModal}
           connection={selectedConnection}
           providerId={providerId}
+          providerWebsite={providerInfo.website}
           onSave={handleUpdateConnection}
           onResyncModels={(id) => handleCompatibleImportWithProgress(id, "sync")}
           onClose={() => setShowEditModal(false)}

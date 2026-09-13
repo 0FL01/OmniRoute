@@ -10,7 +10,9 @@ import { bulkWebSessionImportSchema } from "../../src/shared/validation/schemas.
 import {
   requiresWebSessionCredential,
   getWebSessionCredentialRequirement,
+  canUpdateProviderApiKey,
   hasUsableWebSessionCredential,
+  resolveWebSessionImportApiKey,
 } from "../../src/shared/providers/webSessionCredentials.ts";
 
 describe("bulkWebSessionImportSchema", () => {
@@ -149,24 +151,84 @@ describe("web-session credential helpers", () => {
       }),
       true
     );
-    assert.equal(
-      hasUsableWebSessionCredential("chatgpt-web", { cookie: "" }),
-      false
-    );
-    assert.equal(
-      hasUsableWebSessionCredential("chatgpt-web", {}),
-      false
-    );
+    assert.equal(hasUsableWebSessionCredential("chatgpt-web", { cookie: "" }), false);
+    assert.equal(hasUsableWebSessionCredential("chatgpt-web", {}), false);
   });
 
   it("hasUsableWebSessionCredential validates token data correctly", () => {
+    assert.equal(hasUsableWebSessionCredential("deepseek-web", { token: "my-token" }), true);
+    assert.equal(hasUsableWebSessionCredential("deepseek-web", { token: "   " }), false);
+  });
+});
+
+describe("canUpdateProviderApiKey", () => {
+  it("preserves normal API-key credential updates", () => {
+    assert.equal(canUpdateProviderApiKey("apikey", "openai"), true);
+  });
+
+  it("allows token-kind web sessions stored with cookie authType", () => {
+    assert.equal(canUpdateProviderApiKey("cookie", "deepseek-web"), true);
+    assert.equal(canUpdateProviderApiKey("cookie", "zai-web"), true);
+  });
+
+  it("does not allow cookie-kind web sessions to update apiKey", () => {
+    assert.equal(canUpdateProviderApiKey("cookie", "chatgpt-web"), false);
+    assert.equal(canUpdateProviderApiKey("cookie", "claude-web"), false);
+  });
+
+  it("does not broaden non-cookie auth types", () => {
+    assert.equal(canUpdateProviderApiKey("oauth", "deepseek-web"), false);
+    assert.equal(canUpdateProviderApiKey(null, "deepseek-web"), false);
+  });
+});
+
+describe("resolveWebSessionImportApiKey (token-kind imports must populate apiKey)", () => {
+  // Regression: the bulk web-session import stored token-kind credentials
+  // (deepseek-web, copilot-web, t3-chat-web, …) only in providerSpecificData and
+  // left apiKey null. Both the connection validator (validateDeepSeekWebProvider)
+  // and the executor (extractUserToken → credentials.apiKey) read the token from
+  // apiKey, so imported token-kind connections were never recognized. Token-kind
+  // must resolve the credential into apiKey; cookie-kind keeps apiKey null (those
+  // executors read providerSpecificData.cookie).
+  it("returns the credential for a token-kind provider (deepseek-web)", () => {
+    const req = getWebSessionCredentialRequirement("deepseek-web");
     assert.equal(
-      hasUsableWebSessionCredential("deepseek-web", { token: "my-token" }),
-      true
+      resolveWebSessionImportApiKey(req, "j9CVFGvd8Y/deadbeeftoken"),
+      "j9CVFGvd8Y/deadbeeftoken"
+    );
+  });
+
+  it("preserves a JSON-wrapped userToken verbatim (extractUserToken unwraps it later)", () => {
+    const req = getWebSessionCredentialRequirement("deepseek-web");
+    const blob = '{"value":"abc123","__version":"0"}';
+    assert.equal(resolveWebSessionImportApiKey(req, blob), blob);
+  });
+
+  it("returns null for cookie-kind providers (they read providerSpecificData.cookie)", () => {
+    assert.equal(
+      resolveWebSessionImportApiKey(
+        getWebSessionCredentialRequirement("claude-web"),
+        "sessionKey=abc"
+      ),
+      null
     );
     assert.equal(
-      hasUsableWebSessionCredential("deepseek-web", { token: "   " }),
-      false
+      resolveWebSessionImportApiKey(
+        getWebSessionCredentialRequirement("chatgpt-web"),
+        "__Secure-next-auth.session-token=abc"
+      ),
+      null
     );
+  });
+
+  it("returns null for a whitespace-only or missing credential", () => {
+    const req = getWebSessionCredentialRequirement("deepseek-web");
+    assert.equal(resolveWebSessionImportApiKey(req, "   "), null);
+    assert.equal(resolveWebSessionImportApiKey(null, "anything"), null);
+  });
+
+  it("trims surrounding whitespace from the stored token", () => {
+    const req = getWebSessionCredentialRequirement("copilot-web");
+    assert.equal(resolveWebSessionImportApiKey(req, "  tok-123  "), "tok-123");
   });
 });

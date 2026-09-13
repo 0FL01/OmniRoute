@@ -36,6 +36,39 @@ export function setConnectionRateLimitUntil(connectionId: string, until: number 
 }
 
 /**
+ * Mark a connection as rate-limited until `Date.now() + retryAfterMs`.
+ *
+ * Best-effort: never throws — a DB failure must not crash the chat path. The T05
+ * startup helper `clearStaleCrashCooldowns` will not undo a write made here because
+ * the timestamp is always strictly in the future at the moment of write. See Issue #1
+ * (per-account 429 cascade not persisting).
+ */
+export function markConnectionRateLimitedUntil(connectionId: string, retryAfterMs: number): void {
+  if (typeof connectionId !== "string" || connectionId.length === 0) return;
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return;
+  try {
+    setConnectionRateLimitUntil(connectionId, Date.now() + retryAfterMs);
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Clear a connection's persisted 429 cooldown.
+ *
+ * Best-effort: never throws. Mirrors `resetAccountState`'s in-memory clear so the
+ * in-memory AccountState and the DB row agree.
+ */
+export function clearConnectionRateLimit(connectionId: string): void {
+  if (typeof connectionId !== "string" || connectionId.length === 0) return;
+  try {
+    setConnectionRateLimitUntil(connectionId, null);
+  } catch {
+    // best-effort
+  }
+}
+
+/**
  * T05: Check if a connection is currently rate-limited (DB-backed).
  * Use this before account selection to skip transiently rate-limited accounts.
  *
@@ -92,6 +125,27 @@ export function getEffectiveQuotaUsage(
 }
 
 /**
+ * Normalize a persisted `rate_limited_until` to epoch ms.
+ *
+ * The column is written in two shapes: epoch ms by `setConnectionRateLimitUntil`
+ * (the chat path) and an ISO-8601 string by `updateProviderConnection` (the
+ * dashboard/AUTH path). Returns null when the value is absent or unparseable —
+ * callers treat that as "no usable deadline".
+ */
+function parseCooldownUntilMs(value: string | number | null | undefined): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const raw = String(value).trim();
+  if (raw === "") return null;
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
  * T05: Startup crash-recovery — clear stale transient connection cooldowns.
  *
  * After an unclean crash (SIGKILL, OOM-kill, large-body burst) the normal
@@ -105,9 +159,19 @@ export function getEffectiveQuotaUsage(
  *  - Only connections with `rate_limited_until IS NOT NULL` are touched.
  *  - Terminal states (`banned`, `expired`, `credits_exhausted`) are skipped —
  *    those require a deliberate credential change or operator reset.
- *  - Past timestamps are also cleared: they are already expired in the lazy
+ *  - Past timestamps are cleared: they are already expired in the lazy
  *    expiry sense, but clearing them resets `backoffLevel` / transient error
- *    fields so the connection gets a clean slate on this fresh process.
+ *    fields so the connection gets a clean slate on this fresh process. An
+ *    unparseable timestamp is treated the same way — it can never expire
+ *    lazily, so leaving it would strand the connection forever.
+ *  - FUTURE timestamps are NEVER cleared. Clearing them was the original
+ *    behaviour and it wiped legitimate multi-day quota cooldowns on every
+ *    container recreate: a GLM weekly cap persisted until 2026-08-29 came
+ *    back `active` with `rate_limited_until = NULL`, combo dispatched it
+ *    immediately, and the connection re-earned a real upstream 429. A stale
+ *    crash-backoff value is bounded by the engine's own cooldown cap, so
+ *    honouring it costs at most that window — far less than burning quota
+ *    against an upstream that is provably exhausted.
  *
  * Must be called once, early in the startup sequence, before any request
  * is handled.  Returns the number of connections that were cleared.
@@ -115,6 +179,7 @@ export function getEffectiveQuotaUsage(
 export function clearStaleCrashCooldowns(): { cleared: number } {
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
+  const nowMs = Date.now();
 
   // Fetch all connections that have a rate_limited_until set and are NOT in
   // a terminal state.  We do the terminal-status filter in JS to reuse the
@@ -123,13 +188,20 @@ export function clearStaleCrashCooldowns(): { cleared: number } {
 
   const rows = db
     .prepare(
-      `SELECT id, test_status FROM provider_connections WHERE rate_limited_until IS NOT NULL`
+      `SELECT id, test_status, rate_limited_until FROM provider_connections WHERE rate_limited_until IS NOT NULL`
     )
-    .all() as Array<{ id: string; test_status: string | null }>;
+    .all() as Array<{
+    id: string;
+    test_status: string | null;
+    rate_limited_until: string | number | null;
+  }>;
 
   const toReset = rows.filter((r) => {
     const status = (r.test_status || "").trim().toLowerCase();
-    return !TERMINAL_STATUSES.has(status);
+    if (TERMINAL_STATUSES.has(status)) return false;
+    const untilMs = parseCooldownUntilMs(r.rate_limited_until);
+    // Unparseable → clear (cannot expire lazily). Future → keep.
+    return untilMs === null || untilMs <= nowMs;
   });
 
   if (toReset.length === 0) return { cleared: 0 };
@@ -157,21 +229,9 @@ export function clearStaleCrashCooldowns(): { cleared: number } {
   return { cleared: toReset.length };
 }
 
-/**
- * T13: Format a reset countdown as a human-readable string: "2h 35m" or "4m 30s".
- * Returns null if resetAt is in the past or not set.
- */
-export function formatResetCountdown(resetAt: string | number | null | undefined): string | null {
-  if (!resetAt) return null;
-  const resetTime = typeof resetAt === "number" ? resetAt : new Date(resetAt).getTime();
-  if (isNaN(resetTime)) return null;
-  const diffMs = resetTime - Date.now();
-  if (diffMs <= 0) return null;
-  const totalSeconds = Math.floor(diffMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
+// T13: Format a reset countdown as a human-readable string ("2h 35m" / "4m 30s").
+// The implementation lives in the client-safe formatting utils so client
+// components (e.g. CoolingConnectionsPanel) can import it without pulling this
+// server-only DB module (better-sqlite3/ioredis) into the browser bundle.
+// Re-exported here for existing server-side callers and the db/providers barrel.
+export { formatResetCountdown } from "@/shared/utils/formatting";

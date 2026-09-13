@@ -17,6 +17,49 @@ export const APIKEY_PROVIDERS_INFERENCE = {
       apiKeyUrl: "https://api.together.ai/settings/api-keys",
     },
   },
+  // OpenVecta — OpenAI-compatible AI inference gateway (https://openvecta.com/).
+  // Catalog seeded from the live /v1/models list (LLMs + embeddings); free credits
+  // advertised on signup. Bearer-token auth via Authorization: Bearer ov_sk_…
+  openvecta: {
+    id: "openvecta",
+    alias: "openvecta",
+    name: "OpenVecta",
+    icon: "vector_polygon",
+    color: "#7C3AED",
+    textIcon: "OV",
+    website: "https://openvecta.com",
+    hasFree: true,
+    freeNote:
+      "Free credits on signup for OpenAI-compatible inference across LLMs, embeddings, and reasoning models",
+  },
+  // Openference — OpenAI-compatible AI inference gateway (https://openference.com/).
+  // API-key auth via Authorization: Bearer sk-… on the same gateway as OAuth JWTs.
+  "openference-api": {
+    id: "openference-api",
+    alias: "ofa",
+    name: "Openference API",
+    icon: "openference",
+    color: "#6366F1",
+    textIcon: "OF",
+    website: "https://openference.com",
+    hasFree: true,
+    freeNote: "Free plan: 3-day trial with open-source models — no credit card required",
+  },
+  poolside: {
+    id: "poolside",
+    alias: "poolside",
+    name: "Poolside",
+    icon: "memory",
+    color: "#111827",
+    textIcon: "PS",
+    passthroughModels: true,
+    website: "https://poolside.ai",
+    hasFree: true,
+    freeNote:
+      "Laguna S 2.1 and XS 2.1 are free during Preview; no public numeric quota is published.",
+    apiHint:
+      "Create a free developer API key, then use https://inference.poolside.ai/v1 as the OpenAI-compatible base URL.",
+  },
   fireworks: {
     id: "fireworks",
     alias: "fireworks",
@@ -61,6 +104,20 @@ export const APIKEY_PROVIDERS_INFERENCE = {
     hasFree: true,
     freeNote: "~$1 trial credits on signup for API testing",
   },
+  nube: {
+    id: "nube",
+    alias: "nube",
+    name: "Nube.sh",
+    icon: "cloud",
+    color: "#2563EB",
+    textIcon: "NB",
+    website: "https://nube.sh",
+    hasFree: false,
+    notice: {
+      text: "OpenAI-compatible gateway (LiteLLM). Bring your own API key — models are resolved live from the account (passthrough).",
+      apiKeyUrl: "https://nube.sh/dashboard/api-keys",
+    },
+  },
   siliconflow: {
     id: "siliconflow",
     alias: "siliconflow",
@@ -70,7 +127,8 @@ export const APIKEY_PROVIDERS_INFERENCE = {
     textIcon: "SF",
     website: "https://cloud.siliconflow.com",
     hasFree: true,
-    freeNote: "$1 free credits plus permanently free models after identity verification",
+    freeNote:
+      "$1 free credits plus currently listed $0 models after identity verification; availability and limits may change",
   },
   hyperbolic: {
     id: "hyperbolic",
@@ -103,18 +161,6 @@ export const APIKEY_PROVIDERS_INFERENCE = {
     website: "https://huggingface.co",
     hasFree: true,
     freeNote: "Free Inference API for thousands of models (Whisper, VITS, SDXL…)",
-  },
-  "github-models": {
-    id: "github-models",
-    alias: "ghm",
-    name: "GitHub Models",
-    icon: "code",
-    color: "#238636",
-    textIcon: "GH",
-    website: "https://github.com/marketplace/models",
-    hasFree: true,
-    freeNote: "Free GPT-5, o-series, DeepSeek-R1, Llama 4, Grok 3 — GitHub account only.",
-    authHint: "Create a GitHub PAT with 'models: read' scope at github.com/settings/tokens",
   },
   deepinfra: {
     id: "deepinfra",
@@ -264,6 +310,24 @@ export const APIKEY_PROVIDERS_INFERENCE = {
       "One-time signup trial credits for decentralized GPU inference (no recurring free plan). No credit card required.",
     passthroughModels: true,
     authHint: "Get API key at monsterapi.ai",
+    deprecated: true,
+    deprecationReason:
+      "Monster API shuttered operations on 2026-06-30. Use alternative OpenAI-compatible providers.",
+  },
+  modelscope: {
+    id: "modelscope",
+    alias: "ms",
+    name: "ModelScope",
+    icon: "cloud",
+    color: "#FF6A00",
+    textIcon: "MS",
+    website: "https://modelscope.cn",
+    hasFree: true,
+    // #1764 (upstream 9router): OpenAI-compatible API-Inference. Base URL verified
+    // live against ModelScope's own docs — the upstream PR used the `.ai` TLD, but
+    // the confirmed production domain is `api-inference.modelscope.cn` (see registry
+    // entry + test guard).
+    freeNote: "Free tier via ModelScope API-Inference — Alibaba account required.",
   },
   byteplus: {
     id: "byteplus",
@@ -277,6 +341,22 @@ export const APIKEY_PROVIDERS_INFERENCE = {
     notice: {
       text: "Free credits for new accounts. Seed 2.0, Kimi K2 Thinking, GLM 4.7, GPT-OSS-120B available.",
       apiKeyUrl: "https://console.byteplus.com/ark/region:ark+ap-southeast-1/apiKey",
+    },
+    serviceKinds: ["llm"],
+  },
+  digitalocean: {
+    id: "digitalocean",
+    alias: "digitalocean",
+    name: "DigitalOcean",
+    icon: "cloud",
+    color: "#0060FF",
+    textIcon: "DO",
+    passthroughModels: true,
+    website: "https://docs.digitalocean.com/products/ai-platform/",
+    hasFree: false,
+    notice: {
+      text: "Use a DigitalOcean Personal Access Token (dop_v1_...) or a Model Access Key from the Inference console. OAuth tokens (doo_v1_...) may not have the required scopes.",
+      apiKeyUrl: "https://cloud.digitalocean.com/account/api/tokens",
     },
     serviceKinds: ["llm"],
   },

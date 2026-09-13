@@ -44,6 +44,10 @@ test("resolveEndpointCategory: maps /v1/embeddings to 'embeddings'", () => {
   assert.equal(resolveEndpointCategory("/v1/embeddings"), "embeddings");
 });
 
+test("resolveEndpointCategory: maps /v1/multimodal-embeddings to 'embeddings'", () => {
+  assert.equal(resolveEndpointCategory("/v1/multimodal-embeddings"), "embeddings");
+});
+
 test("resolveEndpointCategory: maps /v1/images/generations to 'images'", () => {
   assert.equal(resolveEndpointCategory("/v1/images/generations"), "images");
 });
@@ -78,6 +82,10 @@ test("resolveEndpointCategory: maps /v1/models to 'models'", () => {
 
 test("resolveEndpointCategory: maps /v1/moderations to 'moderations'", () => {
   assert.equal(resolveEndpointCategory("/v1/moderations"), "moderations");
+});
+
+test("resolveEndpointCategory: maps /v1/ocr to 'ocr'", () => {
+  assert.equal(resolveEndpointCategory("/v1/ocr"), "ocr");
 });
 
 test("resolveEndpointCategory: maps /v1/batches to 'batches'", () => {

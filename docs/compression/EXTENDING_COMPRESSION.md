@@ -1,7 +1,7 @@
 ---
 title: "Extending the Compression Pipeline"
-version: 3.8.40
-lastUpdated: 2026-06-28
+version: 3.8.44
+lastUpdated: 2026-07-02
 ---
 
 # Extending the Compression Pipeline
@@ -509,6 +509,96 @@ To drive it from config, set `mode: "stacked"` and provide the step array under
   }
 }
 ```
+
+---
+
+## Upstream Sync Policy
+
+OmniRoute's compression engines credit several upstream projects in the README
+("inspired by RTK, Caveman, LLMLingua-2, Troglodita"). A common contributor
+question is: **when upstream RTK adds a new tool filter or Caveman adds a rule
+pack, how does that reach OmniRoute?** This section is the authoritative answer.
+
+### Vendored copies vs. independent implementations
+
+| Engine                       | Relationship to upstream                                                                                                        | Location                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| **RTK**                      | **Independent reimplementation** (inspired-by, not a copy)                                                                      | `open-sse/services/compression/engines/rtk/`                        |
+| **Caveman**                  | **Independent reimplementation** (inspired-by)                                                                                  | `open-sse/services/compression/engines/cavemanAdapter.ts`           |
+| **Headroom**                 | Mostly internal; only the `gcf/` codec is **genuinely vendored** from `gcf-typescript` (MIT, SPDX-marked, generic profile only) | `open-sse/services/compression/engines/headroom/gcf/`               |
+| **LLMLingua-2 / Troglodita** | Inspired-by (drive the `llmlingua` + `session-dedup` engines)                                                                   | `open-sse/services/compression/engines/llmlingua/`, `session-dedup` |
+
+Key point: **RTK and Caveman are clean-room TypeScript implementations of the
+_ideas_ (filter rules, rule packs), not vendored source trees.** There is no
+upstream copy to `git pull` from — which is exactly why the README says
+"inspired by" rather than "bundled".
+
+### How upstream improvements are merged
+
+There is **no automated upstream-release tracking and no `compression-sync`
+label** — by design. Because the engines are reimplementations, an upstream RTK
+filter or Caveman rule pack is not merged as code; it is **re-expressed as a new
+rule/filter in OmniRoute's own format** (see
+[COMPRESSION_RULES_FORMAT.md](./COMPRESSION_RULES_FORMAT.md)) and lands ad-hoc via
+a normal PR. The extension points above (custom engine, language pack, RTK filter)
+are the sanctioned way to contribute one.
+
+Recent examples of exactly this flow:
+
+- RTK filters for Gradle & `dotnet` build output (v3.8.42)
+- RTK filters for kubectl / docker-build / composer / gh (#2824)
+- Caveman Indonesian language pack (#3975), plus German / French / Japanese / Chinese packs
+
+### Headroom (input-compression proxy)
+
+Headroom is **fully internal** — a pinned vendored `gcf` codec snapshot plus
+OmniRoute's own `smartcrusher` / `toon` / `tabular` layers. There is no live
+upstream to track beyond the vendored copy; updates to `gcf` are refreshed
+manually when the codec changes and re-validated against the compression budget
+gate (`check:compression-budget`).
+
+### Proposing an upstream-inspired improvement
+
+1. **Don't vendor** — re-express the upstream rule/filter in OmniRoute's format.
+2. Add it via the matching extension point below (language pack, RTK filter, or
+   custom engine).
+3. Reference the upstream project in the PR description (attribution), not by
+   copying its license-bearing source.
+4. Include tests and confirm the `check:compression-budget` gate still passes.
+
+---
+
+## Adding an Output Style
+
+Output styles (see the [guide's catalog table](./COMPRESSION_GUIDE.md#output-styles-catalog))
+are the response-side counterpart of the input engines: instead of compressing what you
+send, they instruct the model to produce cheaper output. The registry is
+`OUTPUT_STYLE_CATALOG` in `open-sse/services/compression/outputStyles/catalog.ts`, and
+**one catalog entry is the entire feature**: the injector, the dashboard settings panel,
+persistence and telemetry all enumerate the catalog — there is no other list to update.
+
+1. **Add one entry to `OUTPUT_STYLE_CATALOG`** with `id`, `label`, `description` and the
+   three English `levels` (`lite`, `full`, `ultra`). Every level must end with
+   `${SHARED_BOUNDARIES}` so code, paths, commands, errors and URLs stay verbatim.
+   The instruction text must be **static and deterministic** per
+   `(id, level, language)` — `${SHARED_BOUNDARIES}` is the only interpolation allowed.
+2. **Translate it.** Ship at least a `pt-BR` block under `i18n`; `ponytail` and
+   `i-have-adhd` (en, pt-BR, vi, ja, id) are the reference shape. A deliberately
+   single-language style sets `locale` instead (like `terse-cjk` → `zh`) and is then
+   only offered under that locale.
+3. **Update the matrix guard** — add the style's languages to `BASELINE_LANGUAGES` in
+   `tests/unit/compression/output-styles-i18n-matrix.test.ts`. The gate fails any new
+   non-locale-gated style without the required translations unless it carries an
+   explicit `KNOWN_ENGLISH_ONLY` entry with a tracking issue.
+4. **Add a per-style test** modeled on
+   `tests/unit/compression/i-have-adhd-catalog.test.ts`: catalog shape, boundaries
+   clause per level, and an anchor asserting each translation is written in its own
+   language rather than copied English.
+5. **Attribution**: if the style is adapted from an upstream project, credit it in a
+   source comment on the entry (e.g. `i-have-adhd` → ayghri/i-have-adhd, MIT) — same
+   rule as "Proposing an upstream-inspired improvement" above.
+
+No UI, schema or telemetry change is needed — those surfaces render from the catalog.
 
 ---
 

@@ -15,6 +15,7 @@ const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
 const auth = await import("../../src/sse/services/auth.ts");
 const quotaCache = await import("../../src/domain/quotaCache.ts");
 const fallback = await import("../../open-sse/services/accountFallback.ts");
+const oauthOccupancy = await import("../../open-sse/services/oauthSessionOccupancy.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
@@ -64,6 +65,7 @@ async function flushWrites() {
 }
 
 test.beforeEach(async () => {
+  oauthOccupancy._clearOAuthSessionOccupancyForTest();
   await resetStorage();
 });
 
@@ -113,6 +115,13 @@ test("extractApiKey parses bearer headers and isValidApiKey validates persisted 
   assert.equal(await auth.isValidApiKey(created.key), true);
   assert.equal(await auth.isValidApiKey("sk-missing"), false);
   assert.equal(await auth.isValidApiKey(""), false);
+});
+
+test("getProviderCredentials identifies synthetic no-auth credentials", async () => {
+  const credentials = await auth.getProviderCredentials("opencode");
+
+  assert.equal(credentials?.connectionId, "noauth");
+  assert.equal(credentials?.authType, "none");
 });
 
 test("getProviderCredentials reports rate limiting when only inactive suppressed records remain", async () => {
@@ -228,10 +237,12 @@ test("getProviderCredentials enforces generic quota policy unless explicitly byp
   assert.equal(bypassed.connectionId, connection.id);
 });
 
-test("getProviderCredentialsWithQuotaPreflight skips exhausted preflight accounts and selects the next healthy one", async () => {
+test("getProviderCredentialsWithQuotaPreflight persists exhausted accounts until reset and selects a healthy sibling", async () => {
+  const resetAt = futureIso(120_000);
   const blocked = await seedConnection("openai", {
     name: "quota-preflight-blocked",
     apiKey: "sk-preflight-blocked",
+    priority: 1,
     providerSpecificData: {
       quotaPreflightEnabled: true,
     },
@@ -239,21 +250,66 @@ test("getProviderCredentialsWithQuotaPreflight skips exhausted preflight account
   const healthy = await seedConnection("openai", {
     name: "quota-preflight-healthy",
     apiKey: "sk-preflight-healthy",
+    priority: 2,
     providerSpecificData: {
       quotaPreflightEnabled: true,
     },
   });
 
   const quotaPreflight = await import("../../open-sse/services/quotaPreflight.ts");
-  quotaPreflight.registerQuotaFetcher("openai", async (connectionId) => ({
-    used: connectionId === blocked.id ? 100 : 40,
-    total: 100,
-    percentUsed: connectionId === blocked.id ? 1.0 : 0.4,
-  }));
+  const preflightCalls: string[] = [];
+  quotaPreflight.registerQuotaFetcher("openai", async (connectionId) => {
+    preflightCalls.push(connectionId);
+    return {
+      used: connectionId === blocked.id ? 100 : 40,
+      total: 100,
+      percentUsed: connectionId === blocked.id ? 1.0 : 0.4,
+      resetAt: connectionId === blocked.id ? resetAt : null,
+      windows: {
+        session: {
+          percentUsed: connectionId === blocked.id ? 1.0 : 0.4,
+          resetAt: connectionId === blocked.id ? resetAt : null,
+        },
+        weekly: {
+          percentUsed: 0.2,
+          resetAt: null,
+        },
+      },
+    };
+  });
 
-  const selected = await auth.getProviderCredentialsWithQuotaPreflight("openai");
+  const selected = await auth.getProviderCredentialsWithQuotaPreflight(
+    "openai",
+    null,
+    null,
+    "glm-5.2"
+  );
 
   assert.equal((selected as any).connectionId, healthy.id);
+  const blockedAfter = await providersDb.getProviderConnectionById(blocked.id);
+  assert.equal(blockedAfter?.testStatus, "unavailable");
+  assert.equal(blockedAfter?.rateLimitedUntil, resetAt);
+  assert.equal(blockedAfter?.lastErrorType, "quota_exhausted");
+  assert.equal(blockedAfter?.lastErrorSource, "quota_preflight");
+  assert.match(String(blockedAfter?.lastError), /glm-5\.2/);
+
+  const healthyAfter = await providersDb.getProviderConnectionById(healthy.id);
+  assert.equal(healthyAfter?.testStatus, "active");
+  assert.equal(healthyAfter?.rateLimitedUntil ?? null, null);
+
+  preflightCalls.length = 0;
+  const selectedAgain = await auth.getProviderCredentialsWithQuotaPreflight(
+    "openai",
+    null,
+    null,
+    "glm-5.2"
+  );
+  assert.equal((selectedAgain as any).connectionId, healthy.id);
+  assert.deepEqual(
+    preflightCalls,
+    [healthy.id],
+    "persisted lockout must skip the exhausted account on later selections"
+  );
 });
 
 test("getProviderCredentialsWithQuotaPreflight returns allRateLimited when a forced connection is blocked by preflight", async () => {
@@ -478,6 +534,45 @@ test("getProviderCredentials keeps separate codex affinity per session", async (
   assert.equal(sessionB2.connectionId, second.id);
 });
 
+test("concurrent OAuth selections reserve different available accounts atomically", async () => {
+  await settingsDb.updateSettings({
+    fallbackStrategy: "fill-first",
+    codexSessionAffinityTtlMs: 0,
+  });
+  const first = await seedConnection("codex", {
+    authType: "oauth",
+    name: "codex-occupancy-a",
+    priority: 1,
+  });
+  const second = await seedConnection("codex", {
+    authType: "oauth",
+    name: "codex-occupancy-b",
+    priority: 1,
+  });
+  assert.ok(second.priority <= first.priority + 1);
+
+  const [sessionA, sessionB] = await Promise.all([
+    auth.getProviderCredentials("codex", null, null, "gpt-5.5", {
+      sessionKey: "occupancy-session-a",
+      reserveOAuthSession: true,
+    }),
+    auth.getProviderCredentials("codex", null, null, "gpt-5.5", {
+      sessionKey: "occupancy-session-b",
+      reserveOAuthSession: true,
+    }),
+  ]);
+
+  assert.equal(sessionA.authType, "oauth");
+  assert.equal(typeof sessionA.releaseOAuthSession, "function");
+  assert.equal(
+    oauthOccupancy.getForeignOAuthSessionCount(sessionA.connectionId, "occupancy-session-b"),
+    1
+  );
+  assert.notEqual(sessionA.connectionId, sessionB.connectionId);
+  sessionA.releaseOAuthSession?.();
+  sessionB.releaseOAuthSession?.();
+});
+
 test("getProviderCredentials rebinds codex session when affinity connection is excluded", async () => {
   await settingsDb.updateSettings({
     fallbackStrategy: "round-robin",
@@ -670,7 +765,12 @@ test("getProviderCredentials intersects forcedConnectionId with allowedConnectio
     }
   );
 
-  assert.equal(selected, null);
+  // #8893: a forced pin outside the eligible pool is DROPPED (not honored) so a
+  // stale reset-aware pin cannot brick the request — selection falls back to the
+  // policy-allowed pool. The policy-blocked connection must never be selected.
+  assert.equal(selected.connectionId, allowedConn.id);
+  assert.equal(selected.apiKey, "sk-allowed");
+  assert.notEqual(selected.connectionId, blockedConn.id);
 });
 
 test("getProviderCredentials retains rate-limited accounts when allowSuppressedConnections is enabled", async () => {
@@ -716,7 +816,7 @@ test("getProviderCredentials retains terminal accounts for combo live tests", as
   });
   const updated = await providersDb.getProviderConnectionById(connection.id);
 
-  assert.equal(blocked, null);
+  assert.equal(blocked?.allExpired, true);
   assert.equal(bypassed.connectionId, connection.id);
   assert.equal(updated.testStatus, "banned");
 });
@@ -1049,6 +1149,31 @@ test("getProviderCredentials resolves the nvidia special alias pool", async () =
   assert.equal(selected.connectionId, connection.id);
 });
 
+test("getProviderCredentials resolves the antigravity / agy alias pool", async () => {
+  const connection = await seedConnection("agy", {
+    name: "antigravity-alias-connection",
+  });
+
+  const selected = await auth.getProviderCredentials("antigravity");
+
+  assert.equal(selected.connectionId, connection.id);
+});
+
+test("getProviderCredentials shares one Jina token across foundation, reader, and search", async () => {
+  const connection = await seedConnection("jina-ai", {
+    name: "jina-foundation-key",
+    apiKey: "jina-dashboard-key",
+  });
+
+  const viaSearch = await auth.getProviderCredentials("jina-search");
+  const viaReader = await auth.getProviderCredentials("jina-reader");
+
+  assert.ok(viaSearch && !("allExpired" in viaSearch));
+  assert.ok(viaReader && !("allExpired" in viaReader));
+  assert.equal(viaSearch.connectionId, connection.id);
+  assert.equal(viaReader.connectionId, connection.id);
+});
+
 test("getProviderCredentials exposes copilotToken when present in providerSpecificData", async () => {
   const connection = await seedConnection("codex", {
     authType: "oauth",
@@ -1303,36 +1428,6 @@ test("Codex quota policy keeps normal and Spark windows separate", async () => {
   assert.match(String(sparkSelected.lastError), /configured quota threshold/i);
 });
 
-test("markAccountUnavailable stores Codex scope-specific cooldowns without a global rate limit", async () => {
-  const connection = await seedConnection("codex", {
-    authType: "oauth",
-    name: "codex-scope",
-    email: "codex@example.com",
-    apiKey: null,
-    accessToken: "codex-access",
-    refreshToken: "codex-refresh",
-  });
-
-  const result = await auth.markAccountUnavailable(
-    connection.id,
-    429,
-    "quota reached",
-    "codex",
-    "codex-spark-mini"
-  );
-  const updated = await providersDb.getProviderConnectionById(connection.id);
-  const selected = await auth.getProviderCredentials("codex", null, null, "codex-spark-mini");
-  const normalSelected = await auth.getProviderCredentials("codex", null, null, "gpt-5.3-codex");
-
-  assert.equal(result.shouldFallback, true);
-  assert.ok(result.cooldownMs > 0);
-  assert.equal(updated.testStatus, "unavailable");
-  assert.equal(updated.rateLimitedUntil, undefined);
-  assert.ok(updated.providerSpecificData.codexScopeRateLimitedUntil.spark);
-  assert.equal(selected.allRateLimited, true);
-  assert.equal(normalSelected.connectionId, connection.id);
-});
-
 test("markAccountUnavailable returns without fallback on bad requests", async () => {
   const connection = await seedConnection("openai", {
     name: "bad-request-no-fallback",
@@ -1449,6 +1544,56 @@ test("markAccountUnavailable auto-disables permanently banned accounts when the 
     "Verify your account to continue",
     "openai",
     "gpt-4o"
+  );
+  const updated = await providersDb.getProviderConnectionById(connection.id);
+
+  assert.equal(result.shouldFallback, true);
+  assert.equal(updated.isActive, false);
+  assert.equal(updated.testStatus, "banned");
+});
+
+test("markAccountUnavailable keeps prepaid API keys active when auto-disable scope is subscription", async () => {
+  await settingsDb.updateSettings({
+    autoDisableBannedAccounts: true,
+    autoDisableBannedScope: "subscription",
+  });
+  const connection = await seedConnection("openai", {
+    name: "prepaid-key-stays-on",
+    authType: "apikey",
+  });
+
+  const result = await auth.markAccountUnavailable(
+    connection.id,
+    401,
+    "Verify your account to continue",
+    "openai",
+    "gpt-4o"
+  );
+  const updated = await providersDb.getProviderConnectionById(connection.id);
+
+  assert.equal(result.shouldFallback, true);
+  assert.equal(updated.isActive, true);
+  assert.equal(updated.testStatus, "banned");
+});
+
+test("markAccountUnavailable still auto-disables OAuth accounts when scope is subscription", async () => {
+  await settingsDb.updateSettings({
+    autoDisableBannedAccounts: true,
+    autoDisableBannedScope: "subscription",
+  });
+  const connection = await seedConnection("claude", {
+    name: "oauth-subscription-ban",
+    authType: "oauth",
+    accessToken: "oauth-access-token",
+    refreshToken: "oauth-refresh-token",
+  });
+
+  const result = await auth.markAccountUnavailable(
+    connection.id,
+    401,
+    "Verify your account to continue",
+    "claude",
+    "claude-sonnet"
   );
   const updated = await providersDb.getProviderConnectionById(connection.id);
 
